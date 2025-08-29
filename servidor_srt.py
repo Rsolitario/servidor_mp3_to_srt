@@ -1,58 +1,69 @@
 # ==============================================================================
-# PASO 1: INSTALACIÓN Y CONFIGURACIÓN DEL ENTORNO
+# PASO 1: INSTALACIÓN Y CONFIGURACIÓN
 # ==============================================================================
 print("Paso 1: Instalando librerías necesarias...")
-!pip install flask flask-ngrok pyngrok --quiet
+!pip install flask pycloudflared openai-whisper ffmpeg-python --quiet
 
 import os
-import time
 import threading
-from flask import Flask, request, jsonify, send_from_directory
-from pyngrok import ngrok
-from generacion_subtitulos_fast import DynamicSubtitleGeneratorFast
 import logging
+import uuid
+from flask import Flask, request, jsonify, send_from_directory, url_for
+from pycloudflared import try_cloudflare
+from generacion_subtitulos_fast import DynamicSubtitleGeneratorFast
+from werkzeug.utils import secure_filename
 
-# --- Configuración de ngrok (MUY RECOMENDADO) ---
-# Ve a https://dashboard.ngrok.com/get-started/your-authtoken
-# Copia tu token y pégalo aquí para evitar límites de tiempo.
-NGROK_AUTH_TOKEN = ""  # PEGA TU TOKEN DE NGROK AQUÍ. EJ: "2Duw...xyz"
-
-if NGROK_AUTH_TOKEN:
-    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
-    print("Token de ngrok configurado exitosamente.")
-else:
-    print("ADVERTENCIA: No se ha configurado un token de ngrok. La sesión puede expirar pronto.")
-
-# --- Configuración de Flask ---
+tasks = {}
 UPLOAD_FOLDER = 'uploads'
 RESULT_FOLDER = 'results'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
-
 app = Flask(__name__)
-PORT = 5000 # Flask se ejecutará en el puerto 5000
+PORT = 5000
 
 # ==============================================================================
-# PASO 2: TU LÓGICA DE PROCESAMIENTO (PLACEHOLDER)
+# PASO 2: LÓGICA DE PROCESAMIENTO (AHORA AISLADA Y CORREGIDA)
 # ==============================================================================
-def generar_srt_desde_video(AUDIO_FILE: str, srt_path: str) -> None:
-    """
-    PLACEHOLDER: Inserta tu lógica de generación de SRT aquí.
-    Esta función se ejecutará dentro del entorno de Colab.
-    """
-    generator = DynamicSubtitleGeneratorFast(audio_path=AUDIO_FILE)
-    # 2. Generar los subtítulos
-    if generator.all_words:
-        generator.generate(srt_path=srt_path)
-    else:
-        logging.error("No se pudo generar subtítulos porque la transcripción falló o devolvió una lista vacía.")
+def process_video_in_background(task_id: str, video_path: str, srt_path: str, srt_filename: str):
+    global tasks
+    # --- INICIO DE LA CORRECCIÓN: Sintaxis de Python con indentación ---
+    try:
+        print(f"[{task_id}] Hilo iniciado. Cargando modelo para: {video_path}")
+        tasks[task_id]['status'] = 'processing'
+        
+        # Esta es la operación lenta que ahora está completamente aislada
+        generator = DynamicSubtitleGeneratorFast(audio_path=video_path)
+        
+        print(f"[{task_id}] Modelo cargado. Generando subtítulos...")
+        if generator.all_words:
+            generator.generate(srt_path=srt_path)
+        else:
+            raise RuntimeError("La transcripción no produjo resultados.")
+        
+        print(f"[{task_id}] Transcripción completada.")
+        tasks[task_id]['status'] = 'completed'
+        tasks[task_id]['result_filename'] = srt_filename
+        
+    except Exception as e:
+        print(f"[{task_id}] Ha ocurrido un error: {e}")
+        tasks[task_id]['status'] = 'failed'
+        tasks[task_id]['error'] = str(e)
+        
+    finally:
+        # Es importante no borrar el archivo original hasta que el SRT esté generado
+        # Si la tarea falla, quizás quieras inspeccionar el archivo de video
+        if os.path.exists(video_path):
+            os.remove(video_path)
+            print(f"[{task_id}] Archivo de video de origen eliminado.")
+    # --- FIN DE LA CORRECCIÓN ---
 
+# ==============================================================================
+# PASO 3: NUEVAS RUTAS DE LA API
+# ==============================================================================
 
-# ==============================================================================
-# PASO 3: RUTAS DE LA API FLASK (EL CÓDIGO DEL SERVIDOR)
-# ==============================================================================
+# ENDPOINT 1: Solo para subir el archivo. Debe ser rápido.
 @app.route('/upload', methods=['POST'])
-def upload_and_process_video():
+def upload_file():
     if 'video' not in request.files:
         return jsonify({"error": "No se encontró el archivo de video"}), 400
     
@@ -60,50 +71,76 @@ def upload_and_process_video():
     if video_file.filename == '':
         return jsonify({"error": "No se seleccionó ningún archivo"}), 400
 
-    video_path = os.path.join(UPLOAD_FOLDER, video_file.filename)
-    video_file.save(video_path)
+    # Genera un nombre de archivo único para evitar conflictos
+    original_filename = secure_filename(video_file.filename)
+    extension = os.path.splitext(original_filename)[1]
+    unique_filename = f"{uuid.uuid4()}{extension}"
+    
+    video_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+    video_file.save(video_path) # Esta es la única operación que realiza
 
-    srt_filename = f"{os.path.splitext(video_file.filename)[0]}.srt"
-    srt_path = os.path.join(RESULT_FOLDER, srt_filename)
+    print(f"Archivo '{original_filename}' guardado como '{unique_filename}'")
 
-    try:
-        generar_srt_desde_video(video_path, srt_path)
-    except Exception as e:
-        return jsonify({"error": f"Falló el procesamiento del video: {e}"}), 500
-    finally:
-        if os.path.exists(video_path):
-            os.remove(video_path)
-
-    # Devuelve la URL pública completa para la descarga
-    public_url = ngrok.get_tunnels()[0].public_url
     return jsonify({
-        "message": "Procesamiento completado.",
-        "download_url": f"{public_url}/download/{srt_filename}"
+        "message": "Archivo subido exitosamente.",
+        "uploaded_filename": unique_filename
     })
+
+# ENDPOINT 2: Para iniciar el procesamiento de un archivo ya subido. Instantáneo.
+@app.route('/process', methods=['POST'])
+def process_file():
+    data = request.get_json()
+    if not data or 'filename' not in data:
+        return jsonify({"error": "Se requiere el 'filename' del archivo subido."}), 400
+
+    unique_filename = data['filename']
+    video_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+
+    if not os.path.exists(video_path):
+        return jsonify({"error": f"Archivo no encontrado: {unique_filename}"}), 404
+
+    srt_filename = f"{os.path.splitext(unique_filename)[0]}.srt"
+    srt_path = os.path.join(RESULT_FOLDER, srt_filename)
+    
+    task_id = str(uuid.uuid4())
+    tasks[task_id] = {'status': 'pending', 'source_filename': unique_filename}
+
+    background_thread = threading.Thread(
+        target=process_video_in_background,
+        args=(task_id, video_path, srt_path, srt_filename)
+    )
+    background_thread.start()
+
+    status_url = url_for('get_task_status', task_id=task_id, _external=True)
+    return jsonify({
+        "message": "El procesamiento ha comenzado.",
+        "task_id": task_id,
+        "status_url": status_url
+    }), 202
+
+# ENDPOINT 3: Para consultar el estado (sin cambios)
+@app.route('/status/<task_id>', methods=['GET'])
+def get_task_status(task_id):
+    task = tasks.get(task_id)
+    if not task:
+        return jsonify({"error": "ID de tarea no encontrado"}), 404
+    
+    response = task.copy()
+    if response.get('status') == 'completed':
+        response['download_url'] = url_for('download_srt', filename=task['result_filename'], _external=True)
+        
+    return jsonify(response)
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_srt(filename):
     return send_from_directory(RESULT_FOLDER, filename, as_attachment=True)
 
-@app.route('/')
-def index():
-    public_url = ngrok.get_tunnels()[0].public_url
-    return f"Servidor Flask funcionando en Colab. Acceso público en: {public_url}"
-
 # ==============================================================================
-# PASO 4: INICIAR EL SERVIDOR Y EL TÚNEL DE NGROK
+# PASO 4: INICIAR EL SERVIDOR (SIN CAMBIOS)
 # ==============================================================================
-def run_app():
-  # Inicia Flask en un hilo separado para no bloquear la ejecución de la celda
-  flask_thread = threading.Thread(target=app.run, kwargs={'host': '0.0.0.0', 'port': PORT})
-  flask_thread.daemon = True
-  flask_thread.start()
+flask_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=PORT, debug=False))
+flask_thread.daemon = True
+flask_thread.start()
 
-# Abre un túnel HTTP al puerto en el que se ejecuta Flask
-public_url = ngrok.connect(PORT)
+public_url = try_cloudflare(port=PORT)
 print(f"✅ Servidor iniciado. Tu API está disponible públicamente en: {public_url}")
-
-# Ejecutamos la app (esto mantendrá la celda activa)
-run_app()
-# NOTA: La celda se quedará ejecutándose. Esto es normal.
-# Para detener el servidor, interrumpe la ejecución de la celda.
